@@ -12,25 +12,34 @@
  * 由运维用 tmpwatch / systemd-tmpfiles 清理。见方案 §3.3.3。
  */
 import { promises as fs } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, resolve as resolvePath, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { ProxyStorage } from "./proxy-storage.js";
 
+/** Matches atomic temp files created by putText: `<name>.<12-hex>.tmp`. */
+const TMP_FILE_RE = /\.[0-9a-f]{12}\.tmp$/;
+
 export class FsStorage implements ProxyStorage {
   readonly type = "fs" as const;
+  private readonly rootAbs: string;
 
-  constructor(private readonly root: string) {}
+  constructor(private readonly root: string) {
+    this.rootAbs = resolvePath(root);
+  }
 
   private resolve(key: string): string {
     if (!key || key.length === 0) throw new Error(`[fs-storage] invalid empty key`);
+    if (key.includes("\0") || key.includes("\\")) {
+      throw new Error(`[fs-storage] invalid characters in key: ${key}`);
+    }
     if (isAbsolute(key)) throw new Error(`[fs-storage] absolute path not allowed: ${key}`);
     const normalized = normalize(key);
     if (normalized.startsWith("..") || normalized.split(sep).includes("..")) {
       throw new Error(`[fs-storage] path traversal not allowed: ${key}`);
     }
-    const full = join(this.root, normalized);
+    const full = resolvePath(this.rootAbs, normalized);
     // Double check: the resolved path must stay inside root.
-    const rel = relative(this.root, full);
+    const rel = relative(this.rootAbs, full);
     if (rel.startsWith("..") || isAbsolute(rel)) {
       throw new Error(`[fs-storage] path escapes root: ${key}`);
     }
@@ -44,10 +53,15 @@ export class FsStorage implements ProxyStorage {
   async putText(key: string, value: string): Promise<void> {
     const full = this.resolve(key);
     await this.ensureDir(full);
-    // atomic write: tmp + rename
+    // atomic write: tmp + rename; clean up orphan tmp file if rename/write fails
     const tmp = full + "." + randomBytes(6).toString("hex") + ".tmp";
-    await fs.writeFile(tmp, value, "utf-8");
-    await fs.rename(tmp, full);
+    try {
+      await fs.writeFile(tmp, value, "utf-8");
+      await fs.rename(tmp, full);
+    } catch (err) {
+      await fs.unlink(tmp).catch(() => {});
+      throw err;
+    }
   }
 
   async putJSON(key: string, value: unknown): Promise<void> {
@@ -115,33 +129,78 @@ export class FsStorage implements ProxyStorage {
   }
 
   async delPrefix(prefix: string): Promise<number> {
-    // prefix 是目录形式；把它当目录 rmdir -r。为了统计删除数量，先 list 再逐个 unlink 目录。
     const names = await this.listNames(prefix);
     let n = 0;
+    const dirsToPrune = new Set<string>();
     for (const name of names) {
-      await this.del(prefix + name);
+      const fullKey = prefix + name;
+      await this.del(fullKey);
       n++;
+      dirsToPrune.add(dirname(this.resolve(fullKey)));
     }
-    // 顺带清理空目录（best-effort），不影响计数。
-    try {
-      const fullPrefixDir = this.resolve(prefix.replace(/\/+$/, "") || ".");
-      await fs.rm(fullPrefixDir, { recursive: true, force: true });
-    } catch { /* ignore */ }
+    // Best-effort cleanup of empty directories strictly inside rootAbs (never remove rootAbs itself).
+    for (const dir of dirsToPrune) {
+      await this.pruneEmptyDirsUpToRoot(dir);
+    }
     return n;
   }
 
   async listNames(prefix: string): Promise<string[]> {
-    // prefix 通常以 "/" 结尾，代表一个目录；否则视为"目录 basename"过滤器。
-    const dirPart = prefix.endsWith("/") ? prefix : prefix + "/";
-    let dirAbs: string;
-    try {
-      dirAbs = this.resolve(dirPart.replace(/\/+$/, "") || ".");
-    } catch {
+    if (prefix.includes("\0") || prefix.includes("\\") || isAbsolute(prefix)) {
       return [];
     }
+
+    let walkRootAbs: string;
+    let walkRelBase: string;
+
+    if (!prefix) {
+      walkRootAbs = this.rootAbs;
+      walkRelBase = "";
+    } else if (prefix.endsWith("/")) {
+      const trimmedDir = prefix.replace(/\/+$/, "");
+      try {
+        walkRootAbs = trimmedDir ? this.resolve(trimmedDir) : this.rootAbs;
+      } catch {
+        return [];
+      }
+      walkRelBase = trimmedDir ? `${trimmedDir}/` : "";
+    } else {
+      const lastSlash = prefix.lastIndexOf("/");
+      const parentDir = lastSlash === -1 ? "" : prefix.slice(0, lastSlash);
+      try {
+        walkRootAbs = parentDir ? this.resolve(parentDir) : this.rootAbs;
+      } catch {
+        return [];
+      }
+      walkRelBase = parentDir ? `${parentDir}/` : "";
+    }
+
+    const allKeys: string[] = [];
+    await this.walk(walkRootAbs, walkRelBase, allKeys);
+
     const out: string[] = [];
-    await this.walk(dirAbs, "", out);
+    for (const fullKey of allKeys) {
+      if (fullKey.startsWith(prefix)) {
+        out.push(fullKey.slice(prefix.length));
+      }
+    }
+    out.sort();
     return out;
+  }
+
+  private async pruneEmptyDirsUpToRoot(startDir: string): Promise<void> {
+    let current = resolvePath(startDir);
+    while (current !== this.rootAbs) {
+      const rel = relative(this.rootAbs, current);
+      if (!rel || rel.startsWith("..") || isAbsolute(rel)) break;
+      try {
+        await fs.rmdir(current);
+      } catch {
+        // Directory is non-empty or already removed; stop walking upward.
+        break;
+      }
+      current = dirname(current);
+    }
   }
 
   private async walk(absDir: string, relPrefix: string, out: string[]): Promise<void> {
@@ -153,6 +212,9 @@ export class FsStorage implements ProxyStorage {
       throw err;
     }
     for (const e of entries) {
+      if (!e.isDirectory() && TMP_FILE_RE.test(e.name)) {
+        continue;
+      }
       const relName = relPrefix + e.name;
       if (e.isDirectory()) {
         await this.walk(join(absDir, e.name), relName + "/", out);

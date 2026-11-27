@@ -25,7 +25,14 @@ const AGENT_SOURCE_RE = /^[a-z0-9-]+$/;
  * 两个点，误伤成本极低而防注入价值高。
  */
 export function assertKeySegment(name: string, value: string): void {
-  if (!value || value.includes("/") || value.includes("..")) {
+  if (
+    !value ||
+    value === "." ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("\0") ||
+    value.includes("..")
+  ) {
     throw new Error(`invalid ${name}: ${value}`);
   }
 }
