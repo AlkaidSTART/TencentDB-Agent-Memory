@@ -51,8 +51,12 @@ def _decode_response(resp: httpx.Response) -> dict:
         raise TDAMError(-1, "API response must be a JSON object", header_request_id)
 
     code = envelope.get("code")
-    if resp.is_error or code != 0:
-        effective_code = code if isinstance(code, int) and code != 0 else resp.status_code
+    is_valid_int_code = isinstance(code, int) and not isinstance(code, bool)
+    if resp.is_error or not is_valid_int_code or code != 0:
+        if is_valid_int_code and code != 0:
+            effective_code = code
+        else:
+            effective_code = resp.status_code if resp.is_error else -1
         payload = envelope.get("data")
         details = payload if isinstance(payload, dict) else None
         raise TDAMError(
@@ -62,13 +66,26 @@ def _decode_response(resp: httpx.Response) -> dict:
             details=details,
         )
 
-    result = envelope.get("data") or {}
+    raw_result = envelope.get("data")
+    result = {} if raw_result is None else raw_result
     if not isinstance(result, dict):
         raise TDAMError(-1, "API response data must be a JSON object", header_request_id)
     trace_id = resp.headers.get("x-trace-id")
     if trace_id:
         result["trace_id"] = trace_id
     return result
+
+
+def _resolve_request_timeout(timeout: Optional[float], default_timeout: httpx.Timeout) -> float | httpx.Timeout:
+    if timeout is None:
+        return default_timeout
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ParamError("timeout must be a positive number")
+    return timeout
+
+
+def _normalize_path(path: str) -> str:
+    return path if path.startswith("/") else f"/{path}"
 
 
 class HttpStub(Stub):
@@ -86,6 +103,7 @@ class HttpStub(Stub):
     ) -> None:
         _validate_transport_options(endpoint, api_key, service_id, timeout)
         self.endpoint = endpoint.rstrip("/")
+        self._owns_client = client is None
         self.client = client or httpx.Client(timeout=timeout, verify=verify)
         self.headers: Dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
@@ -96,27 +114,29 @@ class HttpStub(Stub):
             self.headers["x-tdai-user-key"] = user_key
 
     def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
+        normalized_path = _normalize_path(path)
         resp = self.client.post(
-            url=f"{self.endpoint}{path}",
+            url=f"{self.endpoint}{normalized_path}",
             json=body,
             headers=self.headers,
-            timeout=timeout or self.client.timeout,
+            timeout=_resolve_request_timeout(timeout, self.client.timeout),
         )
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s %s", normalized_path, resp.text)
         return _decode_response(resp)
 
     def get(self, path: str, query: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
+        normalized_path = _normalize_path(path)
         resp = self.client.get(
-            url=f"{self.endpoint}{path}",
+            url=f"{self.endpoint}{normalized_path}",
             params=query or {},
             headers=self.headers,
-            timeout=timeout or self.client.timeout,
+            timeout=_resolve_request_timeout(timeout, self.client.timeout),
         )
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s %s", normalized_path, resp.text)
         return _decode_response(resp)
 
     def close(self) -> None:
-        if isinstance(self.client, httpx.Client):
+        if self._owns_client and isinstance(self.client, httpx.Client):
             self.client.close()
 
 
@@ -135,6 +155,7 @@ class AsyncHttpStub:
     ) -> None:
         _validate_transport_options(endpoint, api_key, service_id, timeout)
         self.endpoint = endpoint.rstrip("/")
+        self._owns_client = client is None
         self.client = client or httpx.AsyncClient(timeout=timeout, verify=verify)
         self.headers: Dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
@@ -145,25 +166,27 @@ class AsyncHttpStub:
             self.headers["x-tdai-user-key"] = user_key
 
     async def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
+        normalized_path = _normalize_path(path)
         resp = await self.client.post(
-            url=f"{self.endpoint}{path}",
+            url=f"{self.endpoint}{normalized_path}",
             json=body,
             headers=self.headers,
-            timeout=timeout or self.client.timeout,
+            timeout=_resolve_request_timeout(timeout, self.client.timeout),
         )
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s %s", normalized_path, resp.text)
         return _decode_response(resp)
 
     async def get(self, path: str, query: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
+        normalized_path = _normalize_path(path)
         resp = await self.client.get(
-            url=f"{self.endpoint}{path}",
+            url=f"{self.endpoint}{normalized_path}",
             params=query or {},
             headers=self.headers,
-            timeout=timeout or self.client.timeout,
+            timeout=_resolve_request_timeout(timeout, self.client.timeout),
         )
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s %s", normalized_path, resp.text)
         return _decode_response(resp)
 
     async def close(self) -> None:
-        if isinstance(self.client, httpx.AsyncClient):
+        if self._owns_client and isinstance(self.client, httpx.AsyncClient):
             await self.client.aclose()
