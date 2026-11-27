@@ -41,6 +41,12 @@ export class V3HttpTransport {
     }
   }
 
+  async close(): Promise<void> {
+    if (this.dispatcher) {
+      await this.dispatcher.close();
+    }
+  }
+
   async post<T = unknown>(
     path: string,
     body: Record<string, unknown> = {},
@@ -63,9 +69,10 @@ export class V3HttpTransport {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);
     try {
+      const normalizedPath = path.startsWith("/") ? path : `/${path}`;
       const query = method === "GET"
         ? new URLSearchParams(Object.entries(params)
-          .filter(([, value]) => value !== undefined)
+          .filter(([, value]) => value !== undefined && value !== null)
           .map(([key, value]) => [key, String(value)]))
         : undefined;
       const fetchOptions: RequestInit & { dispatcher?: Agent } = {
@@ -75,7 +82,7 @@ export class V3HttpTransport {
         signal: controller.signal,
       };
       if (this.dispatcher) fetchOptions.dispatcher = this.dispatcher;
-      const url = `${this.endpoint}${path}${query && query.size > 0 ? `?${query.toString()}` : ""}`;
+      const url = `${this.endpoint}${normalizedPath}${query && query.size > 0 ? `?${query.toString()}` : ""}`;
       const response = await fetch(url, fetchOptions as RequestInit);
       const responseText = await response.text().catch(() => "");
       const headerRequestId =
@@ -94,9 +101,22 @@ export class V3HttpTransport {
         );
       }
 
+      if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+        throw new TDAMError(
+          response.ok ? -1 : response.status,
+          "API response must be a JSON object",
+          headerRequestId,
+        );
+      }
+
       const businessCode = typeof envelope.code === "number" ? envelope.code : undefined;
       if (!response.ok || businessCode !== 0) {
-        const code = businessCode && businessCode !== 0 ? businessCode : response.status;
+        const code =
+          businessCode !== undefined && businessCode !== 0
+            ? businessCode
+            : response.ok
+              ? -1
+              : response.status;
         const details =
           envelope.data && typeof envelope.data === "object"
             ? (envelope.data as Record<string, unknown>)
@@ -109,9 +129,17 @@ export class V3HttpTransport {
         );
       }
 
-      const result = (envelope.data ?? {}) as T & { trace_id?: string };
+      const rawData = envelope.data ?? {};
+      if (typeof rawData !== "object" || Array.isArray(rawData)) {
+        throw new TDAMError(
+          -1,
+          "API response data must be a JSON object",
+          headerRequestId,
+        );
+      }
+      const result = rawData as T & { trace_id?: string };
       const traceId = response.headers.get("x-trace-id");
-      if (traceId && result && typeof result === "object") {
+      if (traceId) {
         (result as Record<string, unknown>).trace_id = traceId;
       }
       return result;

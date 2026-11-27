@@ -8,6 +8,7 @@
  * - TLS: `rejectUnauthorized` defaults to `false` (self-signed cert friendly).
  */
 
+import { Agent } from "undici";
 import { TDAMError } from "./errors.js";
 import type { ApiResponseEnvelope } from "./types.js";
 
@@ -28,7 +29,7 @@ export class HttpTransport {
   private readonly endpoint: string;
   private readonly headers: Record<string, string>;
   private readonly timeout: number;
-  private dispatcher: unknown;
+  private readonly dispatcher?: Agent;
 
   constructor(opts: HttpTransportOptions) {
     this.endpoint = opts.endpoint.replace(/\/+$/, "");
@@ -42,33 +43,29 @@ export class HttpTransport {
       this.headers["x-tdai-user-key"] = opts.userKey;
     }
 
-    // When rejectUnauthorized=false (default), create an undici Agent that
-    // skips TLS certificate validation. This mirrors the Python SDK's
-    // `verify=False` default for self-signed cert environments.
+    // When rejectUnauthorized=false (default), scope TLS relaxation strictly to
+    // this transport's undici Agent instead of mutating process.env globally.
     if (opts.rejectUnauthorized !== true) {
-      try {
-        // Node 18+ bundles undici; dynamic import to keep zero-dep for bundlers
-        const { Agent } = require("undici");
-        this.dispatcher = new Agent({
-          connect: { rejectUnauthorized: false },
-        });
-      } catch {
-        // If undici is not available (browser/edge runtime), fall back to
-        // process.env which only works in Node.js.
-        if (typeof process !== "undefined") {
-          process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-        }
-      }
+      this.dispatcher = new Agent({
+        connect: { rejectUnauthorized: false },
+      });
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.dispatcher) {
+      await this.dispatcher.close();
     }
   }
 
   async post<T = unknown>(path: string, body: Record<string, unknown> = {}): Promise<T & { trace_id?: string }> {
-    const url = `${this.endpoint}${path}`;
+    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const url = `${this.endpoint}${normalizedPath}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);
 
     try {
-      const fetchOpts: RequestInit & { dispatcher?: unknown } = {
+      const fetchOpts: RequestInit & { dispatcher?: Agent } = {
         method: "POST",
         headers: this.headers,
         body: JSON.stringify(body),
@@ -85,21 +82,37 @@ export class HttpTransport {
         throw new TDAMError(resp.status, `HTTP ${resp.status}: ${text}`);
       }
 
-      const envelope = (await resp.json()) as ApiResponseEnvelope<T>;
+      const responseText = await resp.text().catch(() => "");
+      let envelope: ApiResponseEnvelope<T>;
+      try {
+        envelope = JSON.parse(responseText) as ApiResponseEnvelope<T>;
+      } catch {
+        const reqId = resp.headers.get("x-qcloud-transaction-id") ?? resp.headers.get("x-trace-id") ?? "";
+        throw new TDAMError(
+          -1,
+          responseText || `HTTP ${resp.status} returned a non-JSON response`,
+          reqId,
+        );
+      }
 
-      if (envelope.code !== 0) {
+      if (!envelope || typeof envelope !== "object" || envelope.code !== 0) {
         const reqId =
-          resp.headers.get("x-qcloud-transaction-id") ?? envelope.request_id ?? "";
+          resp.headers.get("x-qcloud-transaction-id") ?? envelope?.request_id ?? "";
         const details =
-          envelope.data && typeof envelope.data === "object"
+          envelope?.data && typeof envelope.data === "object"
             ? (envelope.data as Record<string, unknown>)
             : undefined;
-        throw new TDAMError(envelope.code, envelope.message, reqId, details);
+        throw new TDAMError(
+          typeof envelope?.code === "number" ? envelope.code : -1,
+          envelope?.message ?? "API response must be a JSON object",
+          reqId,
+          details,
+        );
       }
 
       const result = (envelope.data ?? {}) as T & { trace_id?: string };
       const traceId = resp.headers.get("x-trace-id");
-      if (traceId) {
+      if (traceId && result && typeof result === "object") {
         (result as Record<string, unknown>).trace_id = traceId;
       }
       return result;
