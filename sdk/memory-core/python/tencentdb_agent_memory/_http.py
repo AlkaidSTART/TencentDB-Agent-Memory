@@ -64,6 +64,7 @@ class HttpStub(Stub):
         client: Optional[httpx.Client] = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
+        self._owns_client = client is None
         self.client = client or httpx.Client(timeout=timeout, verify=verify)
         self.headers: Dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
@@ -74,15 +75,16 @@ class HttpStub(Stub):
             self.headers["x-tdai-user-key"] = user_key
 
     def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
-        url = f"{self.endpoint}{path}"
-        logger.debug("Request %s %s", path, body)
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        url = f"{self.endpoint}{normalized_path}"
+        logger.debug("Request %s %s", normalized_path, body)
         resp = self.client.post(
             url=url,
             json=body,
             headers=self.headers,
-            timeout=timeout or self.client.timeout,
+            timeout=self.client.timeout if timeout is None else timeout,
         )
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s %s", normalized_path, resp.text)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
@@ -95,14 +97,15 @@ class HttpStub(Stub):
                 request_id=req_id,
                 details=details,
             )
-        result: dict = data.get("data", {})
+        raw_result = data.get("data")
+        result: dict = {} if raw_result is None else raw_result
         trace_id = resp.headers.get("x-trace-id")
-        if trace_id:
+        if trace_id and isinstance(result, dict):
             result["trace_id"] = trace_id
         return result
 
     def close(self) -> None:
-        if isinstance(self.client, httpx.Client):
+        if self._owns_client and isinstance(self.client, httpx.Client):
             self.client.close()
 
 
@@ -124,6 +127,7 @@ class AsyncHttpStub:
         client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
+        self._owns_client = client is None
         self.client = client or httpx.AsyncClient(timeout=timeout, verify=verify)
         self.headers: Dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
@@ -134,15 +138,16 @@ class AsyncHttpStub:
             self.headers["x-tdai-user-key"] = user_key
 
     async def post(self, path: str, body: dict, timeout: Optional[float] = None) -> dict:
-        url = f"{self.endpoint}{path}"
-        logger.debug("Request %s %s", path, body)
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        url = f"{self.endpoint}{normalized_path}"
+        logger.debug("Request %s %s", normalized_path, body)
         resp = await self.client.post(
             url=url,
             json=body,
             headers=self.headers,
-            timeout=timeout or self.client.timeout,
+            timeout=self.client.timeout if timeout is None else timeout,
         )
-        logger.debug("Response %s %s", path, resp.text)
+        logger.debug("Response %s %s", normalized_path, resp.text)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
@@ -155,12 +160,13 @@ class AsyncHttpStub:
                 request_id=req_id,
                 details=details,
             )
-        result: dict = data.get("data", {})
+        raw_result = data.get("data")
+        result: dict = {} if raw_result is None else raw_result
         trace_id = resp.headers.get("x-trace-id")
-        if trace_id:
+        if trace_id and isinstance(result, dict):
             result["trace_id"] = trace_id
         return result
 
     async def close(self) -> None:
-        if isinstance(self.client, httpx.AsyncClient):
+        if self._owns_client and isinstance(self.client, httpx.AsyncClient):
             await self.client.aclose()
